@@ -17,7 +17,7 @@ const makeShort=async(req,res)=>{
             shortID:shorurl
         })
         await Analytics.create({
-            urlId:id,
+            UrlId:id,
             totalVisits:0,
         })
         return res.json({new_entry})
@@ -42,8 +42,8 @@ const data = await Url.findOne({
       message: "URL not found"
     });
   }
-await data.Analytics.increment('totalVisits');
-return res.send(data)
+await data.Analytic.increment('totalVisits');
+return res.send(data.longURL)
 
 }
 module.exports={makeShort,getUrl};
