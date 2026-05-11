@@ -1,5 +1,9 @@
 const{encode}=require("../service/service");
 const { Url, Analytics } = require("../models/schema");
+const Redis=require("ioredis")
+const redis = new Redis(
+process.env.REDIS_URI);
+
 
 const makeShort=async(req,res)=>{
     const {url:longurl}=req.body;
@@ -20,6 +24,7 @@ const makeShort=async(req,res)=>{
             UrlId:id,
             totalVisits:0,
         })
+        await redis.set(shorurl,longurl)
         return res.json({new_entry})
 
     }
@@ -31,6 +36,8 @@ const makeShort=async(req,res)=>{
 }
 const getUrl=async(req,res)=>{
 const{id}=req.params;
+const cache=await redis.get(id)
+if(cache)return res.send(cache);
 const data = await Url.findOne({
     where: {
       shortID: id
