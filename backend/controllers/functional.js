@@ -49,6 +49,7 @@ const data = await Url.findOne({
       message: "URL not found"
     });
   }
+  await redis.set(id,data.longURL)
 await data.Analytic.increment('totalVisits');
 return res.send(data.longURL)
 
