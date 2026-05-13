@@ -2,39 +2,91 @@
 
 This document provides a deep-dive analysis into the architecture of the URL Shortener project, explaining the scaling patterns, caching strategies, and data consistency models used to handle high-concurrency traffic.
 
-## 1. System Architecture Overview
+---
 
-The system is designed with a **stateless application tier**, a **high-speed caching tier**, and a **persistent storage tier**.
+## 1. High-Level System Architecture
+
+The system uses a **multi-tier architecture** designed for horizontal scalability and sub-millisecond response times.
 
 ```mermaid
 graph TD
-    User((User))
-    LB[Load Balancer / PM2 Cluster]
-    App[Node.js API Instances]
-    Redis[(Redis Cache & Buffer)]
-    MySQL[(MySQL Primary DB)]
-    Sync[Sync Worker Task]
+    subgraph "Client Side"
+        User((End User))
+        Browser[Web Browser]
+    end
 
-    User --> LB
-    LB --> App
-    App <--> Redis
-    App --> MySQL
-    Redis -- "Batch Sync" --> Sync
-    Sync --> MySQL
+    subgraph "Application Tier (Stateless)"
+        LB[PM2 Cluster / Load Balancer]
+        App1[Node.js Instance 1]
+        App2[Node.js Instance 2]
+        AppN[Node.js Instance N]
+    end
+
+    subgraph "Caching & Real-time Tier"
+        Redis[(Redis Cluster)]
+        RateLimit{Rate Limiter}
+    end
+
+    subgraph "Persistence Tier"
+        MySQL[(MySQL Primary)]
+        Analytics[(Analytics Table)]
+    end
+
+    User --> Browser
+    Browser --> LB
+    LB --> App1 & App2 & AppN
+    App1 & App2 & AppN <--> Redis
+    App1 & App2 & AppN --> MySQL
+    Redis -- "Periodic Flush" --> Analytics
 ```
 
 ---
 
-## 2. Core Scaling Patterns
+## 2. The "Write Path" (URL Creation)
 
-### A. Cache-Aside Strategy (Read Optimization)
-To handle massive redirection traffic, we use the **Cache-Aside** pattern. Instead of querying MySQL for every redirect, we use Redis as a high-speed lookaside.
+When a user creates a shortened URL, we prioritize **Data Integrity** over raw speed. We write to the database first, then propagate to the cache.
 
-**The Workflow:**
-1. **Check Cache:** The app checks Redis for the `shortID`.
-2. **Cache Hit:** If found, redirect immediately (0.1ms).
-3. **Cache Miss:** If not found, query MySQL.
-4. **Update Cache:** Save the result in Redis for the next user.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User
+    participant App
+    participant MySQL
+    participant Redis
+
+    User->>App: POST /api/url/shorten {longURL}
+    App->>App: Validate & Generate Unique ID
+    App->>MySQL: INSERT INTO Urls (longURL, shortID)
+    MySQL-->>App: Success (Primary Key ID)
+    App->>Redis: SET id longURL (Pre-caching)
+    App-->>User: 201 Created {shortID}
+```
+
+---
+
+## 3. The "Read Path" (High-Speed Redirect)
+
+This is the most critical path. It uses the **Cache-Aside** pattern to minimize database latency.
+
+```mermaid
+flowchart TD
+    Start([User Clicks Short Link]) --> CheckRedis{Check Redis?}
+    CheckRedis -- "HIT (Fast)" --> Redirect([Redirect Immediately])
+    CheckRedis -- "MISS (Slow)" --> QuerySQL[Query MySQL Database]
+    QuerySQL --> Found{Found?}
+    Found -- "No" --> Error[404 Not Found]
+    Found -- "Yes" --> PopulateRedis[Save to Redis]
+    PopulateRedis --> Redirect
+    
+    style CheckRedis fill:#f9f,stroke:#333,stroke-width:2px
+    style Redirect fill:#00ff00,color:#000
+```
+
+---
+
+## 4. Analytics Buffering (Write-Back Pattern)
+
+Instead of updating the database on every click, we "buffer" increments in Redis and sync them in batches.
 
 ```mermaid
 sequenceDiagram
@@ -42,70 +94,69 @@ sequenceDiagram
     participant App
     participant Redis
     participant MySQL
+    participant SyncTask
 
-    User->>App: GET /api/url/:id
-    App->>Redis: GET id
-    alt Cache Hit
-        Redis-->>App: Long URL
-    else Cache Miss
-        App->>MySQL: SELECT longURL WHERE shortID = id
-        MySQL-->>App: Data
-        App->>Redis: SET id longURL
-    end
-    App-->>User: 302 Redirect
+    Note over User,Redis: User Clicks (Millions of times)
+    User->>App: Redirect Request
+    App->>Redis: INCR clicks:ID
+    App-->>User: Redirected
+    
+    Note over Redis,SyncTask: Every 6 Minutes (Interval)
+    SyncTask->>Redis: KEYS clicks:*
+    SyncTask->>Redis: GET count for each ID
+    SyncTask->>MySQL: UPDATE Analytics SET totalVisits += count
+    SyncTask->>Redis: DEL clicks:* (Reset Buffer)
 ```
 
-### B. Write-Back Buffering (Analytics Optimization)
-Writing "Click Analytics" to a disk-based database (MySQL) on every click is a bottleneck. We use a **Write-Back Buffer** strategy.
+---
 
-1. **Increment in Redis:** Every click triggers `INCR clicks:id` in Redis. This is an atomic operation in memory.
-2. **Delayed Sync:** Every 6 minutes, a background task (`flushClicksToDB`) fetches these counts and performs a **batch update** in MySQL.
+## 5. Security Architecture (Rate Limiting)
 
-**Benefit:** This reduces MySQL write load by 90% or more depending on traffic density.
+We use a distributed sliding window algorithm to prevent API abuse.
+
+```mermaid
+graph LR
+    IP[User IP Address] --> Limiter{Rate Limiter}
+    Limiter -- "< 5 req/min" --> Allow[Allow Request]
+    Limiter -- "> 5 req/min" --> Deny[429 Too Many Requests]
+    
+    subgraph "Redis State"
+        Limiter <--> RKeys[IP_Bucket_Timestamp]
+    end
+```
 
 ---
 
-## 3. Security: Distributed Rate Limiting
+## 6. Database Schema Design (ER Diagram)
 
-To prevent API abuse (e.g., a bot creating millions of links), we implemented **Rate Limiting** using `express-rate-limit` and `rate-limit-redis`.
+The relationship between URLs and their analytics is **1:1** or **1:N** depending on the granularity required.
 
-*   **Mechanism:** Sliding Window.
-*   **Storage:** Redis stores the "Credit" of each IP address.
-*   **Configuration:** 5 requests per minute per IP.
-*   **Why Redis?** If we have 10 servers running (Clustering), they all share the same Redis counter. A user cannot bypass the limit by hitting a different server instance.
+```mermaid
+erDiagram
+    URL ||--|| ANALYTICS : tracks
+    URL {
+        int id PK
+        string longURL
+        string shortID UK
+        datetime createdAt
+    }
+    ANALYTICS {
+        int id PK
+        int totalVisits
+        int urlId FK
+        datetime updatedAt
+    }
+```
 
 ---
 
-## 4. Data Consistency & Durability
+## 7. Reliability: Failure Mode Analysis
 
-| Component | Strategy | Note |
+| Component Failure | Impact | Mitigation Strategy |
 | :--- | :--- | :--- |
-| **URL Mapping** | Strong Consistency | Written to MySQL first, then cached in Redis. |
-| **Analytics** | Eventual Consistency | Accurate in Redis immediately; accurate in MySQL after sync. |
-| **Availability** | High | Redis is highly available; App is clustered via PM2. |
+| **Redis Down** | Slow Response | App falls back to MySQL for all reads/writes. |
+| **MySQL Down** | Outage | Read-only mode can be enabled if Redis is alive. |
+| **App Node Crash** | Minimal | PM2 automatically restarts the process on other cores. |
 
 ---
-
-## 5. Implementation Details
-
-### Database Schema
-We use two normalized tables in MySQL via Sequelize:
-1. **Urls:** Stores the mapping (`id`, `longURL`, `shortID`).
-2. **Analytics:** Stores traffic data (`totalVisits`, `UrlId`).
-
-### Key Technologies
-*   **Node.js & Express:** The application runtime.
-*   **Sequelize ORM:** For structured database interactions.
-*   **ioredis:** A robust Redis client for Node.js.
-*   **PM2:** For process management and CPU core utilization.
-
----
-
-## 6. Future Scaling Roadmap
-
-1. **Database Replication:** Moving to a Master-Slave setup to offload read queries to multiple replicas.
-2. **Content Delivery Network (CDN):** For the frontend to ensure global low-latency.
-3. **Geographic Sharding:** Distributing data based on the user's region (e.g., US data in US-East, Asia data in Mumbai).
-
----
-*Documentation generated for System Design Study - May 2024*
+*Prepared by Antigravity AI for Project Scale-Up - May 2024*
