@@ -37,12 +37,22 @@ const makeShort=async(req,res)=>{
 const getUrl=async(req,res)=>{
 const{id}=req.params;
 const cache=await redis.get(id)
-if(cache)return res.send(cache);
+
+if(cache)
+{
+  await Analytics.increment('totalVisits', {
+  by: 1,
+  where: {
+    UrlId: id,
+  },
+});
+    return res.send(cache);
+
+}   
 const data = await Url.findOne({
     where: {
       shortID: id
-    },
-    include: Analytics
+    }
   });
   if (!data) {
     return res.status(404).json({
@@ -50,7 +60,13 @@ const data = await Url.findOne({
     });
   }
   await redis.set(id,data.longURL)
-await data.Analytic.increment('totalVisits');
+//await data.Analytic.increment('totalVisits');
+ await Analytics.increment('totalVisits', {
+  by: 1,
+  where: {
+    UrlId: id,
+  },
+})
 return res.send(data.longURL)
 
 }
